@@ -4,8 +4,7 @@
   * наименование образца в п. 3.1;
   * количество компонентов в п. 5 («Количество компонентов составило N шт.»);
   * Таблица №4 (строится заново по компонентам и введённым значениям);
-  * Приложение №1 (фото и подписи);
-  * по желанию — пометка «УЧЕБНЫЙ ОБРАЗЕЦ» в колонтитулах.
+  * Приложение №1 (фото и подписи).
 Всё остальное в документе остаётся байт-в-байт как было (остальные части
 пакета не перезаписываются).
 """
@@ -30,14 +29,9 @@ A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 PIC_NS = 'http://schemas.openxmlformats.org/drawingml/2006/picture'
 PKG_REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
 CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
-V_NS = 'urn:schemas-microsoft-com:vml'
-O_NS = 'urn:schemas-microsoft-com:office:office'
-W10_NS = 'urn:schemas-microsoft-com:office:word'
 XML_NS = 'http://www.w3.org/XML/1998/namespace'
 
 IMAGE_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image'
-HEADER_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/header'
-HEADER_CT = 'application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml'
 
 NS = {'w': W_NS, 'r': R_NS, 'wp': WP_NS, 'a': A_NS, 'pic': PIC_NS}
 
@@ -45,7 +39,6 @@ EMU_PER_TWIP = 635
 EMU_PER_CM = 360000
 PHOTO_MAX_HEIGHT_CM = 9.5
 PHOTO_MAX_PIXELS = 2400
-WATERMARK_TEXT = 'УЧЕБНЫЙ ОБРАЗЕЦ'
 
 
 def w(tag: str) -> str:
@@ -574,64 +567,6 @@ def _cleanup_unused_images(tpl: Template) -> None:
                     tpl.ctypes.remove(ov)
 
 
-# --- пометка «УЧЕБНЫЙ ОБРАЗЕЦ» ----------------------------------------------
-
-_SHAPETYPE = f'''<v:shapetype xmlns:v="{V_NS}" xmlns:o="{O_NS}" id="_x0000_t136" coordsize="21600,21600" o:spt="136" adj="10800" path="m@7,l@8,m@5,21600l@6,21600e">
-<v:formulas><v:f eqn="sum #0 0 10800"/><v:f eqn="prod #0 2 1"/><v:f eqn="sum 21600 0 @1"/><v:f eqn="sum 0 0 @2"/><v:f eqn="sum 21600 0 @3"/><v:f eqn="if @0 @3 0"/><v:f eqn="if @0 21600 @1"/><v:f eqn="if @0 0 @2"/><v:f eqn="if @0 @4 21600"/><v:f eqn="mid @5 @6"/><v:f eqn="mid @8 @5"/><v:f eqn="mid @7 @8"/><v:f eqn="mid @6 @7"/><v:f eqn="sum @6 0 @5"/></v:formulas>
-<v:path textpathok="t" o:connecttype="custom" o:connectlocs="@9,0;@10,10800;@11,21600;@12,10800" o:connectangles="270,180,90,0"/>
-<v:textpath on="t" fitshape="t"/><v:handles><v:h position="#0,bottomRight" xrange="6629,14971"/></v:handles>
-<o:lock v:ext="edit" text="t" shapetype="t"/></v:shapetype>'''
-
-
-def _watermark_paragraph(n: int):
-    xml = f'''<w:p xmlns:w="{W_NS}" xmlns:v="{V_NS}" xmlns:o="{O_NS}" xmlns:w10="{W10_NS}">
-<w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr>
-<w:r><w:rPr><w:noProof/></w:rPr><w:pict>{_SHAPETYPE}
-<v:shape id="GpiWaterMark{n}" o:spid="_x0000_s{4090 + n}" type="#_x0000_t136"
- style="position:absolute;margin-left:0;margin-top:0;width:500pt;height:90pt;rotation:315;z-index:-251650000;mso-position-horizontal:center;mso-position-horizontal-relative:margin;mso-position-vertical:center;mso-position-vertical-relative:margin"
- o:allowincell="f" fillcolor="silver" stroked="f"><v:fill opacity=".4"/>
-<v:textpath style="font-family:&quot;Times New Roman&quot;;font-size:1pt" string="{WATERMARK_TEXT}"/>
-<w10:wrap anchorx="margin" anchory="margin"/></v:shape></w:pict></w:r></w:p>'''
-    return etree.fromstring(xml, etree.XMLParser(remove_blank_text=True))
-
-
-def add_watermark(tpl: Template) -> None:
-    header_rels = {r.get('Id'): r.get('Target') for r in tpl.rels if r.get('Type') == HEADER_REL}
-    sects = list(tpl.body.iter(w('sectPr')))
-    targets = set()
-    for sect in sects:
-        refs = sect.findall('w:headerReference', NS)
-        if not any(r.get(w('type')) == 'default' for r in refs):
-            target = _new_header(tpl)
-            rid = _add_rel(tpl, HEADER_REL, target)
-            ref = etree.Element(w('headerReference'))
-            ref.set(w('type'), 'default')
-            ref.set(f'{{{R_NS}}}id', rid)
-            sect.insert(0, ref)
-            header_rels[rid] = target
-            refs = sect.findall('w:headerReference', NS)
-        for ref in refs:
-            t = header_rels.get(ref.get(f'{{{R_NS}}}id'))
-            if t:
-                targets.add('word/' + t)
-    for n, part in enumerate(sorted(targets), start=1):
-        root = etree.fromstring(tpl.parts[part])
-        root.insert(0, _watermark_paragraph(n))
-        tpl.parts[part] = _ser(root)
-
-
-def _new_header(tpl: Template) -> str:
-    n = 1
-    while f'word/header{n}.xml' in tpl.parts:
-        n += 1
-    name = f'header{n}.xml'
-    tpl.parts[f'word/{name}'] = _ser(etree.fromstring(f'<w:hdr xmlns:w="{W_NS}"><w:p/></w:hdr>'))
-    ov = etree.SubElement(tpl.ctypes, f'{{{CT_NS}}}Override')
-    ov.set('PartName', f'/word/{name}')
-    ov.set('ContentType', HEADER_CT)
-    return name
-
-
 # --- точка входа ----------------------------------------------------------
 
 def validate(name: str, photos: list[PhotoSpec], components: list[ComponentSpec]) -> list[str]:
@@ -659,7 +594,7 @@ def validate(name: str, photos: list[PhotoSpec], components: list[ComponentSpec]
 
 
 def build(template_path: str, out_path: str, name: str, photos: list[PhotoSpec],
-          components: list[ComponentSpec], watermark: bool = False) -> BuildReport:
+          components: list[ComponentSpec]) -> BuildReport:
     errors = validate(name, photos, components)
     if errors:
         raise TemplateError('\n'.join(errors))
@@ -672,7 +607,5 @@ def build(template_path: str, out_path: str, name: str, photos: list[PhotoSpec],
     rebuild_appendix(tpl, name, photos, report)
     _ensure_default_ct(tpl, 'jpeg', 'image/jpeg')
     _cleanup_unused_images(tpl)
-    if watermark:
-        add_watermark(tpl)
     tpl.save(out_path)
     return report

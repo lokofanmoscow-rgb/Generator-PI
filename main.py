@@ -24,7 +24,7 @@ def selftest(report_path, template, images):
         count = max((r[1] for r in ranges if r), default=0)
         out = os.path.splitext(report_path)[0] + '.docx'
         rep = build(template, out, 'Тестовый образец, марка "Тест", модель T-1', photos,
-                    [ComponentSpec(n) for n in range(1, count + 1)], watermark=True)
+                    [ComponentSpec(n) for n in range(1, count + 1)])
         f.write(f'docx\t{out}\t{rep}\n')
 
 

@@ -42,7 +42,7 @@ def test_build(tmp_path, photos):
     out = tmp_path / 'out.docx'
     name = 'Ночник светодиодный, марка "Lumio", модель NL-15'
     specs = [PhotoSpec(photos[0]), PhotoSpec(photos[1], (1, 1)), PhotoSpec(photos[2], (2, 6))]
-    rep = build(SAMPLE, str(out), name, specs, _components(), watermark=True)
+    rep = build(SAMPLE, str(out), name, specs, _components())
     assert rep.name_replaced and rep.count_replaced and not rep.warnings
 
     tpl = Template(str(out))
@@ -66,8 +66,10 @@ def test_build(tmp_path, photos):
         assert names[0] == '[Content_Types].xml'
         media = [n for n in names if n.startswith('word/media/')]
         assert len(media) == 3
-        hdrs = [n for n in names if re.match(r'word/header\d+\.xml', n)]
-        assert any('УЧЕБНЫЙ ОБРАЗЕЦ' in z.read(h).decode('utf-8') for h in hdrs)
+        with zipfile.ZipFile(SAMPLE) as src:
+            for n in src.namelist():          # колонтитулы и прочие части не тронуты
+                if re.match(r'word/(header|footer)\d+\.xml', n) or n == 'word/styles.xml':
+                    assert z.read(n) == src.read(n)
         for n in names:
             if n.endswith('.xml') or n.endswith('.rels'):
                 etree.fromstring(z.read(n))

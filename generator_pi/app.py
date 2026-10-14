@@ -462,11 +462,8 @@ class MainFrame(wx.Frame):
         main.Add(split, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
         bottom = wx.BoxSizer(wx.HORIZONTAL)
-        self.watermark = wx.CheckBox(root, label='Пометка «УЧЕБНЫЙ ОБРАЗЕЦ» на страницах')
-        self.watermark.SetValue(self.config.ReadBool('watermark', True))
-        bottom.Add(self.watermark, 0, wx.ALIGN_CENTER_VERTICAL)
         self.status = wx.StaticText(root, label='')
-        bottom.Add(self.status, 1, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 16)
+        bottom.Add(self.status, 1, wx.ALIGN_CENTER_VERTICAL)
         self.btn_go = wx.Button(root, label='Сгенерировать ПИ', size=self.FromDIP(wx.Size(240, 44)))
         self._bold(self.btn_go, 2)
         bottom.Add(self.btn_go, 0)
@@ -786,11 +783,10 @@ class MainFrame(wx.Frame):
             out += '.docx'
         self.config.Write('out_dir', os.path.dirname(out))
         self.config.Write('template', tpl)
-        self.config.WriteBool('watermark', self.watermark.GetValue())
 
         try:
             with wx.BusyInfo('Собираю ПИ…', self):
-                report = build(tpl, out, name, photos, comps, watermark=self.watermark.GetValue())
+                report = build(tpl, out, name, photos, comps)
         except TemplateError as e:
             wx.MessageBox(f'Не удалось собрать ПИ:\n\n{e}', APP_TITLE, wx.ICON_ERROR)
             return
