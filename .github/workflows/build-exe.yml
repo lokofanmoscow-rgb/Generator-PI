@@ -8,6 +8,8 @@ on:
       - 'main.py'
       - 'GeneratorPI.spec'
       - 'requirements.txt'
+      - 'pytest.ini'
+      - 'tests/**'
       - '.github/workflows/build-exe.yml'
 
 jobs:
