@@ -1,0 +1,30 @@
+name: Сборка exe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'generator_pi/**'
+      - 'main.py'
+      - 'GeneratorPI.spec'
+      - 'requirements.txt'
+      - '.github/workflows/build-exe.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Зависимости
+        run: pip install -r requirements.txt pyinstaller msvc-runtime pytest
+      - name: Тесты
+        run: pytest -q tests
+      - name: Сборка
+        run: pyinstaller --noconfirm GeneratorPI.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GeneratorPI
+          path: dist/GeneratorPI.exe

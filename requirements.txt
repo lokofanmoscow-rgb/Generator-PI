@@ -1,0 +1,6 @@
+# Сборка и запуск под Windows (Python 3.12, 64-bit)
+wxPython==4.3.2
+numpy==2.0.2
+onnxruntime==1.31.0
+pillow==12.3.0
+lxml==6.1.3

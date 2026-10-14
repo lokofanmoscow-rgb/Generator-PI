@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+/build/
+/dist/
+.pytest_cache/
+*.docx
+!tests/**/*.docx
