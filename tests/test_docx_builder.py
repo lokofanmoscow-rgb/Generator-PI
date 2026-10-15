@@ -80,3 +80,48 @@ def test_missing_required_value(tmp_path, photos):
     comps[3].values = {V.PB: '53 ± 8'}             # у платы нет брома
     with pytest.raises(TemplateError, match='Общий бром'):
         build(SAMPLE, str(tmp_path / 'x.docx'), 'Образец', [PhotoSpec(photos[0])], comps)
+
+
+def _photo_cells(tpl):
+    """Ячейки таблицы приложения (по одной на фото)."""
+    for tbl in tpl.body.findall('w:tbl', NS):
+        cells = [tc for tr in tbl.findall('w:tr', NS) for tc in tr.findall('w:tc', NS)]
+        if cells and any(text_of(p).startswith('Фото №') for p in cells[0].findall('w:p', NS)):
+            return cells
+    return []
+
+
+def test_components_kept_together_and_captions_spacing(tmp_path, photos):
+    out = tmp_path / 'out.docx'
+    name = 'Стилус Торговой марки: DEXP Модель: AP-01.'
+    specs = [PhotoSpec(photos[0]), PhotoSpec(photos[1], (1, 1)), PhotoSpec(photos[2], (2, 6))]
+    build(SAMPLE, str(out), name, specs, _components())
+    tpl = Template(str(out))
+
+    # Таблица №4: компонент не разрывается между страницами
+    data = [r for r in find_table4(tpl).findall('w:tr', NS) if r.find('w:trPr/w:tblHeader', NS) is None]
+    sizes = [4 if c.category == V.METAL else 5 for c in _components()]
+    pos = 0
+    for size in sizes:
+        rows = data[pos:pos + size]
+        pos += size
+        for k, row in enumerate(rows):
+            assert row.find('w:trPr/w:cantSplit', NS) is not None
+            keeps = {p.find('w:pPr/w:keepNext', NS) is not None for p in row.iter('{%s}p' % NS['w'])}
+            assert keeps == ({True} if k < size - 1 else {False})
+            ppr = row.find('w:tc/w:p/w:pPr', NS)
+            if ppr.find('w:keepNext', NS) is not None and ppr.find('w:pStyle', NS) is not None:
+                assert ppr.index(ppr.find('w:keepNext', NS)) == 1      # порядок элементов pPr
+
+    # Приложение: фото, пусто, «Фото №k», наименование, пусто, «N компонент», пусто
+    cells = _photo_cells(tpl)
+    assert len(cells) == 3
+    texts = [[text_of(p) for p in tc.findall('w:p', NS)] for tc in cells]
+    assert texts[0] == ['', '', 'Фото №1', name, '']
+    assert texts[1] == ['', '', 'Фото №2', 'Компонент. ' + name, '', '1 компонент', '']
+    assert texts[2] == ['', '', 'Фото №3', 'Компоненты. ' + name, '', '2÷6 компоненты', '']
+    assert all(tc.find('w:p[1]//w:drawing', NS) is not None for tc in cells)
+
+    # в п. 3.1 точка не задваивается
+    body_text = '\n'.join(text_of(p) for p in tpl.body.iter('{%s}p' % NS['w']))
+    assert 'AP-01. ' in body_text and 'AP-01..' not in body_text

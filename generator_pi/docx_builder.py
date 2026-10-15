@@ -37,7 +37,7 @@ NS = {'w': W_NS, 'r': R_NS, 'wp': WP_NS, 'a': A_NS, 'pic': PIC_NS}
 
 EMU_PER_TWIP = 635
 EMU_PER_CM = 360000
-PHOTO_MAX_HEIGHT_CM = 9.5
+PHOTO_MAX_HEIGHT_CM = 8.5   # два фото с подписями на страницу A4
 PHOTO_MAX_PIXELS = 2400
 
 
@@ -124,12 +124,13 @@ def _flex_name_regex(name: str) -> re.Pattern:
 
 
 def clean_name(name: str) -> str:
+    """Наименование для п. 3.1: без точки в конце — после него в тексте идёт своя точка."""
     return re.sub(r'\s+', ' ', name).strip().rstrip('.').strip()
 
 
 def appendix_name(name: str) -> str:
-    """В подписях к фото кавычки «ёлочки», как в образце."""
-    name = re.sub(r'"([^"]*)"', '«\\1»', clean_name(name))
+    """В подписях к фото — как введено, но кавычки «ёлочки», как в образце."""
+    name = re.sub(r'"([^"]*)"', '«\\1»', re.sub(r'\s+', ' ', name).strip())
     name = re.sub(r'“([^”]*)”', '«\\1»', name)
     return name
 
@@ -193,7 +194,7 @@ def detect_old_name(tpl: Template) -> str | None:
             t = text_of(p).strip()
             m = re.match(r'^Компонент(?:ы)?\.\s*(.+)$', t)
             if m:
-                return m.group(1).strip()
+                return m.group(1).strip().rstrip('.').strip()
     # иначе — подпись под «Фото №1»
     after_photo1 = False
     for el in region:
@@ -203,7 +204,7 @@ def detect_old_name(tpl: Template) -> str | None:
                 after_photo1 = True
                 continue
             if after_photo1 and t:
-                return t
+                return t.rstrip('.').strip()
     return None
 
 
@@ -298,6 +299,44 @@ def _strip_ids(el) -> None:
                 del node.attrib[attr]
 
 
+def _set_keep_next(p, on: bool) -> None:
+    """«Не отрывать от следующего» для абзаца (w:keepNext идёт сразу после w:pStyle)."""
+    ppr = p.find('w:pPr', NS)
+    if ppr is None:
+        ppr = etree.Element(w('pPr'))
+        p.insert(0, ppr)
+    kn = ppr.find('w:keepNext', NS)
+    if on and kn is None:
+        kn = etree.Element(w('keepNext'))
+        style = ppr.find('w:pStyle', NS)
+        if style is not None:
+            style.addnext(kn)
+        else:
+            ppr.insert(0, kn)
+    elif not on and kn is not None:
+        ppr.remove(kn)
+
+
+def _keep_row(row, keep_with_next: bool) -> None:
+    """Строка не разрывается между страницами; по желанию держится вместе со следующей.
+
+    Так компонент целиком переносится на следующую страницу, если не помещается:
+    у всех строк компонента, кроме последней, включено «не отрывать от следующего».
+    """
+    trpr = row.find('w:trPr', NS)
+    if trpr is None:
+        trpr = etree.Element(w('trPr'))
+        prex = row.find('w:tblPrEx', NS)
+        if prex is not None:
+            prex.addnext(trpr)
+        else:
+            row.insert(0, trpr)
+    if trpr.find('w:cantSplit', NS) is None:
+        trpr.insert(0, etree.Element(w('cantSplit')))
+    for p in row.iter(w('p')):
+        _set_keep_next(p, keep_with_next)
+
+
 def rebuild_table4(tpl: Template, components: list[ComponentSpec]) -> None:
     tbl = find_table4(tpl)
     rows = tbl.findall('w:tr', NS)
@@ -327,9 +366,11 @@ def rebuild_table4(tpl: Template, components: list[ComponentSpec]) -> None:
 
     first_cell_numbered = start_tpl.find('w:tc[1]/w:p/w:pPr/w:numPr', NS) is not None
     for comp in components:
-        for k, element in enumerate(V.elements_for(comp.category)):
+        elements = V.elements_for(comp.category)
+        for k, element in enumerate(elements):
             row = copy.deepcopy(start_tpl if k == 0 else cont_tpl)
             _strip_ids(row)
+            _keep_row(row, keep_with_next=k < len(elements) - 1)
             cells = _cells(row)
             if k == 0 and not first_cell_numbered:
                 _set_cell_text(cells[0], f'{comp.number}.')
@@ -486,14 +527,17 @@ def rebuild_appendix(tpl: Template, name: str, photos: list[PhotoSpec], report: 
         tcw = etree.SubElement(tcpr, w('tcW'))
         tcw.set(w('w'), '5000')
         tcw.set(w('type'), 'pct')
+        # фото, пустая строка, «Фото №k», наименование, пустая строка, «N÷M компоненты»
         tc.append(_para(extra_runs=[_drawing_run(rel_id, cx, cy, doc_pr_id, media_name)]))
         doc_pr_id += 1
+        tc.append(_para())
         tc.append(_para([f'Фото №{k}']))
         if photo.range is None:
             tc.append(_para([cap_name]))
         else:
             single = photo.range[0] == photo.range[1]
             tc.append(_para(['Компонент. ' if single else 'Компоненты. ', cap_name]))
+            tc.append(_para())
             tc.append(_para([range_caption(photo.range)], size=20))
         tc.append(_para())
 
