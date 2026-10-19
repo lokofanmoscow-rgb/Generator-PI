@@ -11,7 +11,7 @@ import traceback
 import wx
 import wx.grid as gridlib
 import wx.lib.scrolledpanel as scrolled
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from . import values as V
 from .docx_builder import ComponentSpec, PhotoSpec, TemplateError, build, validate
@@ -49,6 +49,8 @@ class Photo:
         self.range: tuple[int, int] | None = None
         self.manual = False
         self.bitmap: wx.Bitmap | None = None
+        self.detections = []                    # найденные подписи (для просмотра)
+        self.analysis_size = (1, 1)             # размер кадра, в котором даны их рамки
 
 
 # --- плашки выбора типа -------------------------------------------------------
@@ -214,6 +216,9 @@ class PhotoCard(wx.Panel):
         self.thumb = wx.StaticBitmap(self, size=self.FromDIP(wx.Size(THUMB, THUMB * 3 // 4)))
         if photo.bitmap:
             self.thumb.SetBitmap(photo.bitmap)
+        self.thumb.SetToolTip('Щёлкните, чтобы посмотреть, какие номера найдены на фото')
+        self.thumb.SetCursor(wx.Cursor(wx.CURSOR_MAGNIFIER))
+        self.thumb.Bind(wx.EVT_LEFT_DOWN, lambda e: PreviewDialog(self.frame, self.photo).ShowModal())
         self.title = wx.StaticText(self, label='Фото')
         f = self.title.GetFont()
         f.SetWeight(wx.FONTWEIGHT_BOLD)
@@ -316,6 +321,57 @@ class PhotoCard(wx.Panel):
             self.photo.range = (a, b)
             self.photo.manual = True
             self.frame.on_ranges_changed()
+
+
+class PreviewDialog(wx.Dialog):
+    """Фото крупно; найденные номера обведены зелёными рамками."""
+
+    def __init__(self, parent, photo: Photo):
+        super().__init__(parent, title=os.path.basename(photo.path),
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER | wx.MAXIMIZE_BOX)
+        dw, dh = wx.GetDisplaySize()
+        max_w, max_h = int(dw * 0.9), int(dh * 0.82)
+        try:
+            img = load_image(photo.path)
+        except Exception as e:  # noqa: BLE001
+            img = Image.new('RGB', (400, 300), 'white')
+            photo.error = photo.error or str(e)
+        aw, ah = photo.analysis_size
+        img.thumbnail((max_w, max_h), Image.LANCZOS)
+        k = img.width / float(aw) if aw > 1 else 1.0
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.load_default(size=max(14, int(18 * self.GetDPIScaleFactor())))
+        except TypeError:          # старый Pillow
+            font = ImageFont.load_default()
+        for d in photo.detections:
+            x, y, w, h = (v * k for v in d.box)
+            draw.rectangle((x, y, x + w, y + h), outline=(0, 200, 0), width=3)
+            label = str(d.number)
+            tb = draw.textbbox((0, 0), label, font=font)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            ty = y - th - 6 if y - th - 6 > 0 else y + h + 2
+            draw.rectangle((x, ty, x + tw + 6, ty + th + 6), fill=(0, 160, 0))
+            draw.text((x + 3, ty + 3 - tb[1]), label, fill='white', font=font)
+        wimg = wx.Image(img.width, img.height)
+        wimg.SetData(img.convert('RGB').tobytes())
+
+        if photo.numbers is None:
+            info = 'Номера ещё распознаются…'
+        elif photo.detections:
+            info = (f'Найдены номера: {", ".join(map(str, sorted({d.number for d in photo.detections})))}. '
+                    'Если номер не обведён или прочитан неверно — поправьте диапазон на карточке фото.')
+        else:
+            info = 'Номера на фото не найдены.'
+        text = wx.StaticText(self, label=info)
+        text.Wrap(max_w)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(text, 0, wx.ALL, 8)
+        sizer.Add(wx.StaticBitmap(self, bitmap=wx.Bitmap(wimg)), 0, wx.LEFT | wx.RIGHT, 8)
+        sizer.Add(wx.Button(self, wx.ID_CLOSE, 'Закрыть'), 0, wx.ALL | wx.ALIGN_RIGHT, 8)
+        self.SetSizerAndFit(sizer)
+        self.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_CLOSE), id=wx.ID_CLOSE)
+        self.CenterOnScreen()
 
 
 class PhotoDrop(wx.FileDropTarget):
@@ -581,7 +637,9 @@ class MainFrame(wx.Frame):
             try:
                 if reader is None:
                     reader = NumberReader()
-                numbers = reader.read_numbers(photo.path)
+                dets, size = reader.read_full(photo.path)
+                photo.detections, photo.analysis_size = dets, size
+                numbers = sorted({d.number for d in dets})
                 wx.CallAfter(self._on_ocr_done, photo, numbers, None)
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()

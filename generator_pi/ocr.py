@@ -1,15 +1,18 @@
 """Распознавание номеров компонентов на фотографиях.
 
 Номера на фото — чёрные цифры, нанесённые поверх снимка (с выносными линиями).
-Алгоритм:
+Алгоритм (на фото в полном разрешении, до 4096 px — мелкие подписи нельзя уменьшать):
   1. Маска «чернил»: пиксели, у которых все каналы тёмные.
-  2. Связные области, похожие по форме на цифры, группируются в числа.
-  3. Каждое число распознаётся CRNN-моделью (PP-OCRv3 rec, ONNX) с декодированием,
-     ограниченным только цифрами.
-  4. Отсев ложных срабатываний: по «чистоте» чёрного и по высоте цифр
-     (все подписи на одном фото одного размера).
+  2. Кандидаты на подписи из двух источников:
+     а) связные области, похожие по форме на цифры, склеенные в числа;
+     б) нейросетевой детектор текста PP-OCRv3 det по маске — находит числа,
+        к которым вплотную подходит выносная линия.
+  3. Каждый кандидат распознаётся моделью PP-OCRv3 rec с декодированием только
+     по цифрам; неуверенная «лишняя» цифра с края (кусок линии) отбрасывается.
+  4. Из пересекающихся находок остаётся лучшая; отсев по «чистоте» чёрного
+     и по высоте цифр (все подписи на одном фото одного размера).
 
-Затем assign_ranges() по всем фото сразу подбирает непрерывные диапазоны
+Затем assign_ranges() по всем фото сразу подбирает диапазоны номеров
 (1…a, a+1…b, …), которые лучше всего согласуются с найденными числами.
 """
 from __future__ import annotations
@@ -17,15 +20,21 @@ from __future__ import annotations
 import bisect
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from PIL import Image, ImageOps
 
 INK_THRESHOLD = 90        # пиксель «чёрный», если все каналы < порога
-MAX_SIDE = 1600           # анализ ведётся на уменьшенной копии
-LABEL_DARKNESS_MAX = 50   # медиана яркости цифр подписи не выше
-MIN_SCORE = 0.5
+MAX_SIDE = 4096           # больше — уменьшаем
+DET_SIDE = 3072           # размер входа детектора текста
+MIN_GLYPH_PX = 8          # минимальная высота цифры, px
+MAX_GLYPH_REL = 0.12      # максимальная высота цифры от большей стороны фото
+LABEL_DARKNESS_MAX = 50   # яркость цифр подписи (25-й процентиль) не выше…
+LABEL_DARKNESS_MAX_BIG = 35   # …а у цифр от 24 px — строже: их края JPEG почти не высветляет
+DARK_PERCENTILE = 25
+MIN_SCORE = 0.5           # средняя уверенность по цифрам числа
+MIN_CHAR_SCORE = 0.3      # цифра с краю с меньшей уверенностью — кусок линии
 MAX_NUMBER = 999
 
 
@@ -33,8 +42,14 @@ MAX_NUMBER = 999
 class Detection:
     number: int
     score: float
-    box: tuple[int, int, int, int]   # x, y, w, h на уменьшенной копии
+    box: tuple[int, int, int, int]   # x, y, w, h (в координатах анализа)
     darkness: float
+    char_scores: list[float] = field(default_factory=list)
+    height: float = 0.0              # высота цифр
+
+    @property
+    def min_char(self) -> float:
+        return min(self.char_scores) if self.char_scores else self.score
 
 
 def resource_path(*parts: str) -> str:
@@ -50,13 +65,17 @@ def load_image(path: str) -> Image.Image:
     return im.convert('RGB')
 
 
+_DET_MEAN = np.array([0.485, 0.456, 0.406], np.float32)
+_DET_STD = np.array([0.229, 0.224, 0.225], np.float32)
+
+
 class NumberReader:
-    def __init__(self, model_path: str | None = None):
+    def __init__(self, model_path: str | None = None, det_model_path: str | None = None):
         import onnxruntime as ort
 
-        model_path = model_path or resource_path('models', 'digits_rec.onnx')
         opts = ort.SessionOptions()
         opts.log_severity_level = 3
+        model_path = model_path or resource_path('models', 'digits_rec.onnx')
         self.session = ort.InferenceSession(model_path, sess_options=opts,
                                             providers=['CPUExecutionProvider'])
         chars = self.session.get_modelmeta().custom_metadata_map['character'].splitlines()
@@ -64,9 +83,15 @@ class NumberReader:
         self.digit_idx = np.array([0] + [chars.index(str(d)) for d in range(10)])
         self.input_name = self.session.get_inputs()[0].name
 
+        det_model_path = det_model_path or resource_path('models', 'text_det.onnx')
+        self.det = None
+        if os.path.exists(det_model_path):
+            self.det = ort.InferenceSession(det_model_path, sess_options=opts,
+                                            providers=['CPUExecutionProvider'])
+
     # -- распознавание одного фрагмента ------------------------------------
-    def _recognize(self, crop: np.ndarray) -> tuple[str, float]:
-        """crop: uint8 HxW (0 — чернила, 255 — фон). Возвращает (цифры, уверенность)."""
+    def _recognize(self, crop: np.ndarray) -> tuple[str, list[float]]:
+        """crop: uint8 HxW (0 — чернила, 255 — фон). Возвращает (цифры, уверенность по цифрам)."""
         h, w = crop.shape
         new_w = max(8, int(round(48 * w / h)))
         img = Image.fromarray(crop).resize((new_w, 48), Image.BILINEAR)
@@ -82,65 +107,209 @@ class NumberReader:
                 text += str(k - 1)
                 conf.append(float(sub[t, k]))
             prev = k
-        return text, (float(np.mean(conf)) if conf else 0.0)
+        # неуверенная цифра с края — обычно конец выносной линии
+        while len(text) > 1 and conf[0] < MIN_CHAR_SCORE:
+            text, conf = text[1:], conf[1:]
+        while len(text) > 1 and conf[-1] < MIN_CHAR_SCORE:
+            text, conf = text[:-1], conf[:-1]
+        return text, conf
 
-    # -- поиск подписей ----------------------------------------------------
-    def read(self, path: str) -> list[Detection]:
-        im = load_image(path)
-        im.thumbnail((MAX_SIDE, MAX_SIDE))
-        a = np.asarray(im)
-        brightness = a.max(axis=2)
-        ink = brightness < INK_THRESHOLD
-        side = max(a.shape[:2])
-
-        glyphs = []
+    # -- кандидаты ----------------------------------------------------------
+    def _glyph_boxes(self, ink: np.ndarray, brightness: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Числа из связных областей, похожих на цифры."""
+        side = max(ink.shape)
+        glyphs, rejected = [], []
         for comp in connected_components(ink):
             x, y, w, h, area = comp.x, comp.y, comp.w, comp.h, comp.area
-            if h < 0.012 * side or h > 0.12 * side:
-                continue
-            if w > 1.1 * h or w < 0.12 * h:
+            if h < MIN_GLYPH_PX and w < MIN_GLYPH_PX:
                 continue
             fill = area / float(w * h)
-            if fill < 0.12 or fill > 0.8:
-                continue
-            pixels = np.concatenate([brightness[ry, rx0:rx1] for ry, rx0, rx1 in comp.runs])
-            dark = float(np.median(pixels))
-            if dark > LABEL_DARKNESS_MAX:
-                continue
-            glyphs.append((x, y, w, h, dark))
-        ink = ink.astype(np.uint8)
-
-        dets: list[Detection] = []
+            if (MIN_GLYPH_PX <= h <= MAX_GLYPH_REL * side and 0.12 * h <= w <= 1.1 * h
+                    and 0.12 <= fill <= 0.8):
+                if _dark_enough(brightness, comp.runs, h):
+                    glyphs.append(((x, y, w, h), comp))
+            elif max(w, h) <= 0.5 * side:
+                rejected.append(comp)      # может быть цифрой, к которой прилипла линия
+        if len(glyphs) >= 3:
+            # цифра со сросшейся вертикальной линией намного выше остальных
+            typical = float(np.median([g[0][3] for g in glyphs]))
+            rejected += [c for g, c in glyphs if g[3] > 1.6 * typical]
+            glyphs = [(g, c) for g, c in glyphs if g[3] <= 1.6 * typical]
+        glyphs = [g for g, _ in glyphs]
+        glyphs += _peel_touching(glyphs, rejected, brightness)
+        boxes = []
         for group in _group_glyphs(glyphs):
             x1 = min(g[0] for g in group)
             y1 = min(g[1] for g in group)
             x2 = max(g[0] + g[2] for g in group)
             y2 = max(g[1] + g[3] for g in group)
             pad = int(0.2 * (y2 - y1)) + 2
-            sub = ink[max(0, y1 - pad):y2 + pad, max(0, x1 - pad):x2 + pad]
-            crop = np.where(sub > 0, 0, 255).astype(np.uint8)
-            text, score = self._recognize(crop)
-            if not text or score < MIN_SCORE or len(text) > 3:
+            boxes.append((x1 - pad, y1 - pad, x2 + pad, y2 + pad))
+        return boxes
+
+    def _text_boxes(self, ink: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Области текста по нейросетевому детектору (DB, PP-OCRv3 det)."""
+        if self.det is None:
+            return []
+        h, w = ink.shape
+        s = min(1.0, DET_SIDE / max(h, w))
+        nh = max(32, int(round(h * s / 32)) * 32)
+        nw = max(32, int(round(w * s / 32)) * 32)
+        img = Image.fromarray(np.where(ink, 0, 255).astype(np.uint8)).resize((nw, nh), Image.BILINEAR)
+        gray = np.asarray(img, np.float32) / 255.0
+        x = ((gray[:, :, None] - _DET_MEAN) / _DET_STD).transpose(2, 0, 1)[None].astype(np.float32)
+        pred = self.det.run(None, {self.det.get_inputs()[0].name: x})[0][0, 0]
+        binm = pred > 0.3
+        binm[:-1, :] |= binm[1:, :]          # расширение 2x2, как в PaddleOCR
+        binm[:, :-1] |= binm[:, 1:]
+        boxes = []
+        for c in connected_components(binm):
+            if c.w < 3 or c.h < 3:
+                continue
+            score = float(np.mean(np.concatenate([pred[ry, a:b] for ry, a, b in c.runs])))
+            if score < 0.5:
+                continue
+            d = c.w * c.h * 1.6 / (2 * (c.w + c.h))   # «unclip» прямоугольника
+            boxes.append((int((c.x - d) * w / nw), int((c.y - d) * h / nh),
+                          int((c.x + c.w + d) * w / nw) + 1, int((c.y + c.h + d) * h / nh) + 1))
+        return boxes
+
+    # -- поиск подписей ----------------------------------------------------
+    def read(self, path: str) -> list[Detection]:
+        return self.read_full(path)[0]
+
+    def read_full(self, path: str) -> tuple[list[Detection], tuple[int, int]]:
+        """Найденные подписи и размер (ширина, высота) кадра, в котором даны их рамки."""
+        im = load_image(path)
+        im.thumbnail((MAX_SIDE, MAX_SIDE))
+        a = np.asarray(im)
+        brightness = a.max(axis=2)
+        ink = brightness < INK_THRESHOLD
+        H, W = ink.shape
+        rec_src = np.where(ink, 0, 255).astype(np.uint8)
+
+        dets: list[Detection] = []
+        seen = set()
+        for box in self._glyph_boxes(ink, brightness) + self._text_boxes(ink):
+            x1, y1 = max(0, box[0]), max(0, box[1])
+            x2, y2 = min(W, box[2]), min(H, box[3])
+            if y2 - y1 < MIN_GLYPH_PX or x2 - x1 < 4 or (x1, y1, x2, y2) in seen:
+                continue
+            seen.add((x1, y1, x2, y2))
+            if not ink[y1:y2, x1:x2].any():
+                continue
+            x1, y1, x2, y2 = _trim_lines(ink, x1, y1, x2, y2)
+            sub_ink = ink[y1:y2, x1:x2]
+            if y2 - y1 < MIN_GLYPH_PX or not sub_ink.any():
+                continue
+            dark = float(np.percentile(brightness[y1:y2, x1:x2][sub_ink], DARK_PERCENTILE))
+            text_h = _text_height(sub_ink)
+            if dark > _dark_limit(text_h):
+                continue
+            text, conf = self._recognize(rec_src[y1:y2, x1:x2])
+            if not text or len(text) > 3 or float(np.mean(conf)) < MIN_SCORE:
                 continue
             n = int(text)
             if not 1 <= n <= MAX_NUMBER:
                 continue
-            dets.append(Detection(n, score, (x1, y1, x2 - x1, y2 - y1),
-                                  max(g[4] for g in group)))
-        return _filter_by_height(dets)
+            dets.append(Detection(n, float(np.mean(conf)), (x1, y1, x2 - x1, y2 - y1), dark,
+                                  conf, text_h))
+        return _filter_by_height(_dedupe(dets)), (W, H)
 
     def read_numbers(self, path: str) -> list[int]:
         return sorted({d.number for d in self.read(path)})
 
 
-@dataclass
+def _trim_lines(ink: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> tuple[int, int, int, int]:
+    """Срезает с краёв рамки выносную линию, чтобы её конец не прочитался как «1».
+
+    По высоте — оставляем полосу цифр (строки, где чернил заметно больше, чем у
+    тонкой линии). По ширине — с каждого края убираем длинный (больше 0,6 высоты
+    цифр) участок тонких столбцов; короткий тонкий участок — это часть цифры
+    (например, перекладина «7»), его не трогаем.
+    """
+    sub = ink[y1:y2, x1:x2]
+    rows = sub.sum(axis=1)
+    if rows.max() == 0:
+        return x1, y1, x2, y2
+    # 80-й процентиль, а не максимум: строки горизонтальной линии не должны задавать полосу
+    band = np.nonzero(rows >= 0.4 * np.percentile(rows[rows > 0], 80))[0]
+    th = float(band[-1] - band[0] + 1)
+    pad = int(round(0.25 * th)) + 1
+    ny1, ny2 = max(0, band[0] - pad), min(sub.shape[0], band[-1] + 1 + pad)
+    cols = sub[ny1:ny2].sum(axis=0)
+    thin = max(2.0, 0.2 * th)
+    nz = np.nonzero(cols)[0]
+    if len(nz) == 0:
+        return x1, y1, x2, y2
+    c0, c1 = int(nz[0]), int(nz[-1])
+    left = c0
+    while left <= c1 and cols[left] <= thin:
+        left += 1
+    right = c1
+    while right >= c0 and cols[right] <= thin:
+        right -= 1
+    if left > right:                      # одни тонкие столбцы — это линия, не число
+        return x1, y1, x1, y1
+    nx1 = left - pad if left - c0 >= 0.6 * th else 0
+    nx2 = right + 1 + pad if c1 - right >= 0.6 * th else sub.shape[1]
+    nx1, nx2 = max(0, nx1), min(sub.shape[1], nx2)
+    return x1 + nx1, y1 + ny1, x1 + nx2, y1 + ny2
+
+
+def _text_height(sub_ink: np.ndarray) -> float:
+    """Высота цифр в рамке: строки, где чернил заметно больше, чем у тонкой линии."""
+    rows = sub_ink.sum(axis=1)
+    if rows.max() == 0:
+        return 0.0
+    idx = np.nonzero(rows >= 0.4 * np.percentile(rows[rows > 0], 80))[0]
+    return float(idx[-1] - idx[0] + 1)
+
+
+def _overlap(a, b) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    iw = min(ax + aw, bx + bw) - max(ax, bx)
+    ih = min(ay + ah, by + bh) - max(ay, by)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    return iw * ih / float(min(aw * ah, bw * bh))
+
+
+def _priority(d: Detection) -> tuple:
+    """Порядок отбора: сначала уверенно прочитанные длинные числа, затем по уверенности.
+
+    Обрывок числа («5» от «105», к средней цифре которого подходит линия) читается
+    увереннее целого, поэтому длина важнее средней уверенности."""
+    digits = len(str(d.number)) if d.min_char >= 0.35 else 1
+    return (-digits, -d.score)
+
+
+def _dedupe(dets: list[Detection]) -> list[Detection]:
+    """Из находок на одном месте (разные кандидаты одной подписи) оставляем лучшую."""
+    kept: list[Detection] = []
+    for d in sorted(dets, key=_priority):
+        if all(_overlap(d.box, k.box) <= 0.5 for k in kept):
+            kept.append(d)
+    return kept
+
+
 class Component:
-    x: int
-    y: int
-    w: int
-    h: int
-    area: int
-    runs: list[tuple[int, int, int]]   # (y, x0, x1) — отрезки строк, x1 не включительно
+    """Связная область: рамка, площадь и отрезки строк (y, x0, x1), x1 не включительно.
+
+    Отрезки собираются лениво — их нужно лишь немногим областям."""
+
+    __slots__ = ('x', 'y', 'w', 'h', 'area', '_table', '_idx')
+
+    def __init__(self, x, y, w, h, area, table, idx):
+        self.x, self.y, self.w, self.h, self.area = x, y, w, h, area
+        self._table, self._idx = table, idx
+
+    @property
+    def runs(self) -> list[tuple[int, int, int]]:
+        ys, x0s, x1s = self._table
+        i = self._idx
+        return list(zip(ys[i].tolist(), x0s[i].tolist(), x1s[i].tolist()))
 
 
 def connected_components(mask: np.ndarray) -> list[Component]:
@@ -193,14 +362,77 @@ def connected_components(mask: np.ndarray) -> list[Component]:
     area = np.bincount(labels, weights=(x1s - x0s), minlength=k).astype(np.int64)
 
     order = np.argsort(labels, kind='stable')
-    bounds = np.searchsorted(labels[order], np.arange(k + 1))
-    comps = []
-    for c in range(k):
-        idx = order[bounds[c]:bounds[c + 1]]
-        runs = list(zip(ys[idx].tolist(), x0s[idx].tolist(), x1s[idx].tolist()))
-        comps.append(Component(int(xmin[c]), int(ymin[c]), int(xmax[c] - xmin[c]),
-                               int(ymax[c] - ymin[c] + 1), int(area[c]), runs))
-    return comps
+    bounds = np.searchsorted(labels[order], np.arange(k + 1)).tolist()
+    table = (ys, x0s, x1s)
+    xmin, xmax, ymin, ymax, area = (v.tolist() for v in (xmin, xmax, ymin, ymax, area))
+    return [Component(xmin[c], ymin[c], xmax[c] - xmin[c], ymax[c] - ymin[c] + 1, area[c],
+                      table, order[bounds[c]:bounds[c + 1]]) for c in range(k)]
+
+
+def _dark_limit(height: float) -> float:
+    return LABEL_DARKNESS_MAX_BIG if height >= 24 else LABEL_DARKNESS_MAX
+
+
+def _dark_enough(brightness: np.ndarray, runs, height: float) -> bool:
+    pixels = np.concatenate([brightness[ry, rx0:rx1] for ry, rx0, rx1 in runs])
+    return float(np.percentile(pixels, DARK_PERCENTILE)) <= _dark_limit(height)
+
+
+def _peel_touching(glyphs, rejected, brightness) -> list[tuple[int, int, int, int]]:
+    """Цифра, которой касается выносная линия, сливается с ней в одно пятно.
+
+    Рядом с уже найденными цифрами (слева и справа, в полосе их высоты) берём
+    такие пятна, срезаем с дальнего края тонкие столбцы (линию) и, если остаток
+    похож на цифру той же высоты, добавляем его как цифру.
+    """
+    if not glyphs or not rejected:
+        return []
+    bx0 = np.array([c.x for c in rejected])
+    by0 = np.array([c.y for c in rejected])
+    bx1 = bx0 + np.array([c.w for c in rejected])
+    by1 = by0 + np.array([c.h for c in rejected])
+    found = set()
+    for gx, gy, gw, gh in glyphs:
+        y0, y1 = gy - int(0.1 * gh), gy + gh + int(0.1 * gh) + 1
+        reach = int(1.3 * gh)
+        for side in (-1, 1):
+            wx0, wx1 = (gx + gw, gx + gw + reach) if side > 0 else (gx - reach, gx)
+            hit = np.nonzero((bx0 < wx1) & (bx1 > wx0) & (by0 < y1) & (by1 > y0))[0]
+            for i in hit.tolist():
+                margin = 0.3 * gh
+                if by0[i] < y0 - margin and by1[i] > y1 + margin:
+                    continue                # линия проходит полосу цифр насквозь — не цифра
+                mask = np.zeros((y1 - y0, wx1 - wx0), bool)
+                for ry, a, b in rejected[i].runs:
+                    if y0 <= ry < y1:
+                        a, b = max(a, wx0), min(b, wx1)
+                        if a < b:
+                            mask[ry - y0, a - wx0:b - wx0] = True
+                cols = mask.sum(axis=0)
+                nz = np.nonzero(cols)[0]
+                if len(nz) == 0:
+                    continue
+                c0, c1 = int(nz[0]), int(nz[-1])
+                thin = max(2.0, 0.22 * gh)
+                if side > 0:
+                    while c1 > c0 and cols[c1] <= thin:
+                        c1 -= 1
+                else:
+                    while c0 < c1 and cols[c0] <= thin:
+                        c0 += 1
+                rows = np.nonzero(mask[:, c0:c1 + 1].any(axis=1))[0]
+                if len(rows) == 0:
+                    continue
+                r0, r1 = int(rows[0]), int(rows[-1])
+                w2, h2 = c1 - c0 + 1, r1 - r0 + 1
+                if not (0.6 * gh <= h2 <= 1.3 * gh and 0.25 * gh <= w2 <= 1.1 * gh):
+                    continue
+                pix = brightness[y0:y1, wx0:wx1][mask]
+                if float(np.percentile(pix, DARK_PERCENTILE)) > _dark_limit(h2):
+                    continue
+                found.add((wx0 + c0, y0 + r0, w2, h2))
+    known = set(glyphs)
+    return [g for g in found if g not in known]
 
 
 def _group_glyphs(glyphs):
@@ -241,15 +473,16 @@ def _group_glyphs(glyphs):
 
 
 def _filter_by_height(dets: list[Detection]) -> list[Detection]:
-    """Подписи на одном фото одного размера — убираем выбросы по высоте."""
-    if len(dets) < 2:
+    """Подписи на одном фото одного размера — убираем выбросы по высоте цифр."""
+    good = [d for d in dets if d.height > 0]
+    if len(good) < 3:
         return dets
-    weights = np.array([d.score for d in dets])
-    heights = np.array([d.box[3] for d in dets], dtype=float)
+    weights = np.array([d.score for d in good])
+    heights = np.array([d.height for d in good], dtype=float)
     order = np.argsort(heights)
     cum = np.cumsum(weights[order])
     median_h = heights[order][np.searchsorted(cum, cum[-1] / 2.0)]
-    return [d for d in dets if 0.7 * median_h <= d.box[3] <= 1.4 * median_h]
+    return [d for d in dets if 0.6 * median_h <= d.height <= 1.6 * median_h]
 
 
 # --- распределение диапазонов по фото -------------------------------------
