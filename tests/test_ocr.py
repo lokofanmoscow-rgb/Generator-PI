@@ -79,3 +79,40 @@ def test_connected_components_matches_naive():
         for y, a, b in c.runs:
             seen[y, a:b] += 1
     assert (seen == mask.astype(int)).all()
+
+
+def _make_dense_rows(path, digit_h=47):
+    """Как на реальном фото: два плотных ряда подписей; выноски верхнего ряда подходят
+    к цифрам сверху, выноски нижнего ряда проходят вверх в промежутках между подписями
+    верхнего; рядом — тёмные прорези (не должны читаться как «1»)."""
+    w, h = 3000, 1600
+    rng = np.random.default_rng(3)
+    base = rng.normal(120, 12, (h // 8, w // 8, 3)).clip(0, 255).astype(np.uint8)
+    im = Image.fromarray(base).resize((w, h), Image.BICUBIC)
+    d = ImageDraw.Draw(im)
+    font = ImageFont.truetype(FONT, int(digit_h / 0.7))
+    lw = max(2, int(digit_h * 0.25))
+    pitch = int(3.2 * digit_h)
+    top_y, low_y = 700, 700 + int(2.0 * digit_h)
+    for i, (top, low) in enumerate([(108, 107), (110, 109), (112, 111)]):
+        tx = 700 + i * pitch
+        lx = tx - pitch // 2
+        for num, x, y in ((top, tx, top_y), (low, lx, low_y)):
+            bb = d.textbbox((x, y), str(num), font=font)
+            d.text((x, y), str(num), font=font, fill=(5, 5, 5))
+            cx = (bb[0] + bb[2]) / 2
+            d.line([(cx, bb[1] + 3), (cx, 250)], fill=(0, 0, 0), width=lw)
+    for k in range(6):                                  # прорези в металлической пластине
+        x = 400 + k * 60
+        d.rounded_rectangle((x, 1250, x + 18, 1250 + int(2.4 * digit_h)), radius=8, fill=(25, 25, 25))
+    im.save(path, quality=90)
+    return {107, 108, 109, 110, 111, 112}
+
+
+@pytest.mark.skipif(FONT is None, reason='нет шрифта для синтетического снимка')
+def test_dense_rows_with_crossing_lines_and_slots(tmp_path, reader):
+    path = str(tmp_path / 'dense.jpg')
+    gt = _make_dense_rows(path)
+    found = set(reader.read_numbers(path))
+    assert gt <= found, sorted(gt - found)
+    assert not found - gt, sorted(found - gt)

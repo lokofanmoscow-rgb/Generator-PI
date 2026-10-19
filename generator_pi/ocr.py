@@ -186,11 +186,23 @@ class NumberReader:
         brightness = a.max(axis=2)
         ink = brightness < INK_THRESHOLD
         H, W = ink.shape
-        rec_src = np.where(ink, 0, 255).astype(np.uint8)
+        seen: set = set()
+        # 1-й проход: числа из цифр, найденных по форме; по уверенно прочитанным
+        # узнаём высоту цифр подписей на этом фото
+        dets = self._read_boxes(self._glyph_boxes(ink, brightness), ink, brightness, None, None, seen)
+        sure = [d.height for d in dets if d.score >= 0.8 and d.height > 0]
+        typical_h = float(np.median(sure)) if len(sure) >= 2 else None
+        # 2-й проход: области текста от детектора (с этой высотой проще отделить линии
+        # и разделить слипшиеся в одну строку подписи)
+        dets += self._read_boxes(self._text_boxes(ink), ink, brightness, None, typical_h, seen)
+        return _filter_by_height(_dedupe(dets)), (W, H)
 
+    def _read_boxes(self, boxes, ink, brightness, rec_src, typical_h, seen) -> list[Detection]:
+        H, W = ink.shape
         dets: list[Detection] = []
-        seen = set()
-        for box in self._glyph_boxes(ink, brightness) + self._text_boxes(ink):
+        queue = [(b, 3) for b in boxes]          # (рамка, сколько ещё раз можно делить)
+        while queue:
+            box, splits_left = queue.pop()
             x1, y1 = max(0, box[0]), max(0, box[1])
             x2, y2 = min(W, box[2]), min(H, box[3])
             if y2 - y1 < MIN_GLYPH_PX or x2 - x1 < 4 or (x1, y1, x2, y2) in seen:
@@ -198,29 +210,151 @@ class NumberReader:
             seen.add((x1, y1, x2, y2))
             if not ink[y1:y2, x1:x2].any():
                 continue
-            x1, y1, x2, y2 = _trim_lines(ink, x1, y1, x2, y2)
-            sub_ink = ink[y1:y2, x1:x2]
-            if y2 - y1 < MIN_GLYPH_PX or not sub_ink.any():
+            if typical_h and y2 - y1 > 1.6 * typical_h:
+                y1, y2 = _text_band(ink, x1, y1, x2, y2, typical_h)
+            x1, y1, x2, y2 = _trim_lines(ink, x1, y1, x2, y2, typical_h)
+            if y2 - y1 < MIN_GLYPH_PX or x2 <= x1:
                 continue
-            dark = float(np.percentile(brightness[y1:y2, x1:x2][sub_ink], DARK_PERCENTILE))
+            sub_ink = _without_crossing_lines(ink, x1, y1, x2, y2, typical_h)
+            if not sub_ink.any():
+                continue
             text_h = _text_height(sub_ink)
+            gap_h = typical_h or text_h
+            if splits_left and x2 - x1 > 3.2 * gap_h:
+                # несколько подписей в одной строке («108  110  112») — делим по широким промежуткам
+                parts = _split_by_gaps(sub_ink, gap_h, min_gap_rel=0.9)
+                if len(parts) > 1:
+                    queue += [((x1 + a, y1, x1 + b, y2), splits_left - 1) for a, b in parts]
+                    continue
+            dark = float(np.percentile(brightness[y1:y2, x1:x2][sub_ink], DARK_PERCENTILE))
             if dark > _dark_limit(text_h):
                 continue
-            text, conf = self._recognize(rec_src[y1:y2, x1:x2])
+            text, conf = self._recognize(np.where(sub_ink, 0, 255).astype(np.uint8))
+            if len(text) > 3 and splits_left:
+                # прочитано больше трёх цифр — это несколько подписей; делим по самому широкому промежутку
+                parts = _split_by_gaps(sub_ink, gap_h, widest_only=True)
+                if len(parts) > 1:
+                    queue += [((x1 + a, y1, x1 + b, y2), splits_left - 1) for a, b in parts]
+                continue
             if not text or len(text) > 3 or float(np.mean(conf)) < MIN_SCORE:
                 continue
             n = int(text)
             if not 1 <= n <= MAX_NUMBER:
                 continue
+            if n == 1 and not _looks_like_one(sub_ink, float(np.mean(conf))):
+                continue
             dets.append(Detection(n, float(np.mean(conf)), (x1, y1, x2 - x1, y2 - y1), dark,
                                   conf, text_h))
-        return _filter_by_height(_dedupe(dets)), (W, H)
+        return dets
 
     def read_numbers(self, path: str) -> list[int]:
         return sorted({d.number for d in self.read(path)})
 
 
-def _trim_lines(ink: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> tuple[int, int, int, int]:
+def _without_crossing_lines(ink: np.ndarray, x1: int, y1: int, x2: int, y2: int,
+                            digit_h: float | None) -> np.ndarray:
+    """Маска чернил рамки без линий, проходящих полосу цифр насквозь сверху вниз.
+
+    Такая линия (выноска соседней подписи) в полосе цифр неотличима от «1»;
+    цифра же, даже если к ней подходит линия, сверху и снизу одновременно не продолжается.
+    """
+    sub = ink[y1:y2, x1:x2].copy()
+    h = digit_h or float(y2 - y1)
+    m = max(3, int(0.35 * h))
+    H, W = ink.shape
+    if y1 - m < 0 or y2 + m > H:
+        return sub
+    xa, xb = max(0, x1 - 2), min(W, x2 + 2)
+    ext = ink[y1 - m:y2 + m, xa:xb]
+    near = ext.copy()                                   # линия может быть слегка наклонной
+    near[:, 1:] |= ext[:, :-1]
+    near[:, :-1] |= ext[:, 1:]
+    near[:, 2:] |= ext[:, :-2]
+    near[:, :-2] |= ext[:, 2:]
+    crossing = near[:m].all(axis=0) & near[-m:].all(axis=0) & (near[m:-m].mean(axis=0) > 0.9)
+    crossing = crossing[x1 - xa:x1 - xa + (x2 - x1)]
+    # стираем только узкие полосы — шире линия не бывает
+    i, n = 0, len(crossing)
+    while i < n:
+        if crossing[i]:
+            j = i
+            while j < n and crossing[j]:
+                j += 1
+            if j - i <= 0.35 * h + 4:
+                sub[:, max(0, i - 2):min(n, j + 2)] = False
+            i = j
+        else:
+            i += 1
+    return sub
+
+
+def _split_by_gaps(sub_ink: np.ndarray, digit_h: float, min_gap_rel: float = 0.9,
+                   widest_only: bool = False) -> list[tuple[int, int]]:
+    """Делит строку на отдельные подписи по промежуткам между ними.
+
+    Промежуток — подряд идущие столбцы без чернил или только с тонкой линией
+    (вертикальная выносная линия соседней подписи). Между цифрами одного числа
+    промежуток до ~0,6 высоты цифр (у «1» широкие поля), между подписями — больше.
+    widest_only — разрезать только по самому широкому промежутку.
+    """
+    cols = sub_ink.sum(axis=0)
+    empty = (cols <= max(1.0, 0.2 * digit_h)).tolist()
+    w = len(empty)
+    gaps, i = [], 0
+    while i < w:
+        if empty[i]:
+            j = i
+            while j < w and empty[j]:
+                j += 1
+            if i > 0 and j < w:                      # только внутренние промежутки
+                gaps.append((j - i, i, j))
+            i = j
+        else:
+            i += 1
+    if not gaps:
+        return [(0, w)]
+    if widest_only:
+        cuts = [max(gaps)]
+    else:
+        cuts = [g for g in gaps if g[0] >= min_gap_rel * digit_h]
+    pad = max(2, int(0.15 * digit_h))
+    parts, start = [], 0
+    for _, a, b in sorted(cuts, key=lambda g: g[1]):
+        parts.append((max(0, start - pad if start else 0), min(w, a + pad)))
+        start = b
+    parts.append((max(0, start - pad), w))
+    return [(a, b) for a, b in parts if b - a >= 0.3 * digit_h]
+
+
+def _text_band(ink: np.ndarray, x1: int, y1: int, x2: int, y2: int, digit_h: float) -> tuple[int, int]:
+    """Полоса цифр в высокой рамке (сверху и снизу — выносные линии): окно высотой
+    с цифру, где больше всего чернил."""
+    rows = ink[y1:y2, x1:x2].sum(axis=1).astype(np.int64)
+    win = max(1, int(round(1.1 * digit_h)))
+    if len(rows) <= win:
+        return y1, y2
+    sums = np.convolve(rows, np.ones(win, dtype=np.int64), mode='valid')
+    top = int(np.argmax(sums))
+    pad = int(0.2 * digit_h)
+    return max(y1, y1 + top - pad), min(y2, y1 + top + win + pad)
+
+
+def _looks_like_one(sub_ink: np.ndarray, score: float) -> bool:
+    """Одиночная «1» — самая частая ошибка: так читаются прорези, кромки и куски линий.
+
+    У настоящей «1» в шрифте подписей есть флажок (и часто основание), поэтому она
+    заполняет свою рамку примерно наполовину; брусок или линия — почти целиком.
+    """
+    if score < 0.85:
+        return False
+    ys, xs = np.nonzero(sub_ink)
+    h, w = ys.max() - ys.min() + 1, xs.max() - xs.min() + 1
+    fill = len(ys) / float(h * w)
+    return fill <= 0.7 and w >= 0.2 * h
+
+
+def _trim_lines(ink: np.ndarray, x1: int, y1: int, x2: int, y2: int,
+                digit_h: float | None = None) -> tuple[int, int, int, int]:
     """Срезает с краёв рамки выносную линию, чтобы её конец не прочитался как «1».
 
     По высоте — оставляем полосу цифр (строки, где чернил заметно больше, чем у
@@ -235,6 +369,8 @@ def _trim_lines(ink: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> tuple[in
     # 80-й процентиль, а не максимум: строки горизонтальной линии не должны задавать полосу
     band = np.nonzero(rows >= 0.4 * np.percentile(rows[rows > 0], 80))[0]
     th = float(band[-1] - band[0] + 1)
+    if digit_h:
+        th = min(th, 1.2 * digit_h)
     pad = int(round(0.25 * th)) + 1
     ny1, ny2 = max(0, band[0] - pad), min(sub.shape[0], band[-1] + 1 + pad)
     cols = sub[ny1:ny2].sum(axis=0)
@@ -277,12 +413,12 @@ def _overlap(a, b) -> float:
 
 
 def _priority(d: Detection) -> tuple:
-    """Порядок отбора: сначала уверенно прочитанные длинные числа, затем по уверенности.
+    """Порядок отбора: сначала длинные числа, затем по уверенности.
 
-    Обрывок числа («5» от «105», к средней цифре которого подходит линия) читается
-    увереннее целого, поэтому длина важнее средней уверенности."""
-    digits = len(str(d.number)) if d.min_char >= 0.35 else 1
-    return (-digits, -d.score)
+    Обрывок числа («5» от «105», «1» от «111» — к средней цифре подходит линия)
+    читается увереннее целого, поэтому длина важнее уверенности. Неуверенные
+    крайние цифры (конец линии) к этому моменту уже отброшены в _recognize."""
+    return (-len(str(d.number)), -d.score)
 
 
 def _dedupe(dets: list[Detection]) -> list[Detection]:
@@ -482,7 +618,7 @@ def _filter_by_height(dets: list[Detection]) -> list[Detection]:
     order = np.argsort(heights)
     cum = np.cumsum(weights[order])
     median_h = heights[order][np.searchsorted(cum, cum[-1] / 2.0)]
-    return [d for d in dets if 0.6 * median_h <= d.height <= 1.6 * median_h]
+    return [d for d in dets if 0.7 * median_h <= d.height <= 1.4 * median_h]
 
 
 # --- распределение диапазонов по фото -------------------------------------
