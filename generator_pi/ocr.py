@@ -25,7 +25,9 @@ from dataclasses import dataclass, field
 import numpy as np
 from PIL import Image, ImageOps
 
-INK_THRESHOLD = 90        # пиксель «чёрный», если все каналы < порога
+INK_THRESHOLD = 90        # пиксель «чёрный», если все каналы < порога…
+INK_MAX_CHROMA = 35       # …и цвет почти нейтральный (тёмная кайма сетки коврика — зелёная)…
+INK_DARK_ANY = 55         # …или пиксель очень тёмный (штрих мелкой цифры после JPEG цветной)
 MAX_SIDE = 4096           # больше — уменьшаем
 DET_SIDE = 3072           # размер входа детектора текста
 MIN_GLYPH_PX = 8          # минимальная высота цифры, px
@@ -130,12 +132,10 @@ class NumberReader:
                     glyphs.append(((x, y, w, h), comp))
             elif max(w, h) <= 0.5 * side:
                 rejected.append(comp)      # может быть цифрой, к которой прилипла линия
-        if len(glyphs) >= 3:
-            # цифра со сросшейся вертикальной линией намного выше остальных
-            typical = float(np.median([g[0][3] for g in glyphs]))
-            rejected += [c for g, c in glyphs if g[3] > 1.6 * typical]
-            glyphs = [(g, c) for g, c in glyphs if g[3] <= 1.6 * typical]
-        glyphs = [g for g, _ in glyphs]
+        # цифра со сросшейся вертикальной линией намного выше соседних цифр строки
+        tall = _taller_than_neighbours([g for g, _ in glyphs])
+        rejected += [c for (g, c), t in zip(glyphs, tall) if t]
+        glyphs = [g for (g, _), t in zip(glyphs, tall) if not t]
         glyphs += _peel_touching(glyphs, rejected, brightness)
         boxes = []
         for group in _group_glyphs(glyphs):
@@ -184,7 +184,8 @@ class NumberReader:
         im.thumbnail((MAX_SIDE, MAX_SIDE))
         a = np.asarray(im)
         brightness = a.max(axis=2)
-        ink = brightness < INK_THRESHOLD
+        chroma = brightness - a.min(axis=2)
+        ink = (brightness < INK_THRESHOLD) & ((chroma < INK_MAX_CHROMA) | (brightness < INK_DARK_ANY))
         H, W = ink.shape
         seen: set = set()
         # 1-й проход: числа из цифр, найденных по форме; по уверенно прочитанным
@@ -195,7 +196,12 @@ class NumberReader:
         # 2-й проход: области текста от детектора (с этой высотой проще отделить линии
         # и разделить слипшиеся в одну строку подписи)
         dets += self._read_boxes(self._text_boxes(ink), ink, brightness, None, typical_h, seen)
-        return _filter_by_height(_dedupe(dets)), (W, H)
+        dets = _filter_by_height(_dedupe(dets))
+        if sum(1 for d in dets if d.number >= 10 and d.score >= 0.8) >= 2:
+            # на фото уверенно читаются многозначные номера — неуверенное прочтение скорее всего
+            # не подпись (например, тёмный корпус SMD-резистора с маркировкой)
+            dets = [d for d in dets if d.score >= (0.6 if d.number >= 10 else 0.75)]
+        return dets, (W, H)
 
     def _read_boxes(self, boxes, ink, brightness, rec_src, typical_h, seen) -> list[Detection]:
         H, W = ink.shape
@@ -514,6 +520,26 @@ def _dark_enough(brightness: np.ndarray, runs, height: float) -> bool:
     return float(np.percentile(pixels, DARK_PERCENTILE)) <= _dark_limit(height)
 
 
+def _taller_than_neighbours(glyphs) -> list[bool]:
+    """Для каждой цифры: намного ли она выше соседних цифр в своей строке.
+
+    Сравнение только с соседями (а не с медианой по всему фото), иначе мелкий
+    шум на снимке делает «слишком высокими» все настоящие цифры."""
+    if len(glyphs) < 2:
+        return [False] * len(glyphs)
+    arr = np.array(glyphs, dtype=float)
+    x, y, w, h = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+    out = []
+    for i in range(len(glyphs)):
+        # соседи: правее/левее не дальше своей высоты, по вертикали внутри рамки цифры i
+        dx = np.maximum(x - (x[i] + w[i]), x[i] - (x + w))
+        inside = (y >= y[i] - 0.1 * h) & (y + h <= y[i] + h[i] + 0.1 * h)
+        near = (dx <= h) & inside & (h < h[i])
+        near[i] = False
+        out.append(bool(near.any() and h[i] > 1.6 * float(np.median(h[near]))))
+    return out
+
+
 def _peel_touching(glyphs, rejected, brightness) -> list[tuple[int, int, int, int]]:
     """Цифра, которой касается выносная линия, сливается с ней в одно пятно.
 
@@ -528,11 +554,15 @@ def _peel_touching(glyphs, rejected, brightness) -> list[tuple[int, int, int, in
     bx1 = bx0 + np.array([c.w for c in rejected])
     by1 = by0 + np.array([c.h for c in rejected])
     found = set()
+    H, W = brightness.shape
     for gx, gy, gw, gh in glyphs:
-        y0, y1 = gy - int(0.1 * gh), gy + gh + int(0.1 * gh) + 1
+        y0, y1 = max(0, gy - int(0.1 * gh)), min(H, gy + gh + int(0.1 * gh) + 1)
         reach = int(1.3 * gh)
         for side in (-1, 1):
             wx0, wx1 = (gx + gw, gx + gw + reach) if side > 0 else (gx - reach, gx)
+            wx0, wx1 = max(0, wx0), min(W, wx1)          # у края снимка окно короче
+            if wx1 - wx0 < 2 or y1 - y0 < 2:
+                continue
             hit = np.nonzero((bx0 < wx1) & (bx1 > wx0) & (by0 < y1) & (by1 > y0))[0]
             for i in hit.tolist():
                 margin = 0.3 * gh
@@ -609,15 +639,16 @@ def _group_glyphs(glyphs):
 
 
 def _filter_by_height(dets: list[Detection]) -> list[Detection]:
-    """Подписи на одном фото одного размера — убираем выбросы по высоте цифр."""
+    """Подписи на одном фото одного размера — убираем выбросы по высоте цифр.
+
+    Эталон — уверенно прочитанные многозначные номера (шум ими почти не бывает)."""
     good = [d for d in dets if d.height > 0]
     if len(good) < 3:
         return dets
-    weights = np.array([d.score for d in good])
-    heights = np.array([d.height for d in good], dtype=float)
-    order = np.argsort(heights)
-    cum = np.cumsum(weights[order])
-    median_h = heights[order][np.searchsorted(cum, cum[-1] / 2.0)]
+    ref = [d for d in good if len(str(d.number)) >= 2 and d.score >= 0.8]
+    if len(ref) < 2:
+        ref = good
+    median_h = float(np.median([d.height for d in ref]))
     return [d for d in dets if 0.7 * median_h <= d.height <= 1.4 * median_h]
 
 

@@ -116,3 +116,25 @@ def test_dense_rows_with_crossing_lines_and_slots(tmp_path, reader):
     found = set(reader.read_numbers(path))
     assert gt <= found, sorted(gt - found)
     assert not found - gt, sorted(found - gt)
+
+
+@pytest.mark.skipif(FONT is None, reason='нет шрифта для синтетического снимка')
+def test_labels_at_photo_edges(tmp_path, reader):
+    """Подписи у самого края снимка, к крайней цифре которых вплотную подходит линия,
+    не должны ронять распознавание."""
+    w, h = 1600, 1200
+    im = Image.new('RGB', (w, h), (60, 140, 120))
+    d = ImageDraw.Draw(im)
+    font = ImageFont.truetype(FONT, 40)
+    for num, (x, y, right) in {21: (2, 0, True), 22: (w - 50, 0, False),
+                               23: (2, h - 27, True), 24: (w - 50, h - 27, False)}.items():
+        bb = d.textbbox((0, 0), str(num), font=font)
+        d.text((x - bb[0], y - bb[1]), str(num), font=font, fill=(0, 0, 0))
+        bb = d.textbbox((x - bb[0], y - bb[1]), str(num), font=font)
+        cy = (bb[1] + bb[3]) // 2
+        line = [(bb[2] - 4, cy), (bb[2] + 80, cy)] if right else [(bb[0] - 80, cy), (bb[0] + 4, cy)]
+        d.line(line, fill=(0, 0, 0), width=4)
+    path = str(tmp_path / 'edges.jpg')
+    im.save(path, quality=90)
+    found = set(reader.read_numbers(path))
+    assert not found - {21, 22, 23, 24}
