@@ -138,3 +138,26 @@ def test_labels_at_photo_edges(tmp_path, reader):
     im.save(path, quality=90)
     found = set(reader.read_numbers(path))
     assert not found - {21, 22, 23, 24}
+
+
+@pytest.mark.skipif(FONT is None, reason='нет шрифта для синтетического снимка')
+def test_white_digits_on_dark_parts_are_ignored(tmp_path, reader):
+    """Белая маркировка на тёмных корпусах деталей («101» на SMD-резисторе) — не подписи."""
+    w, h = 2000, 1400
+    im = Image.new('RGB', (w, h), (30, 110, 70))            # зелёная плата
+    d = ImageDraw.Draw(im)
+    small = ImageFont.truetype(FONT, 34)
+    for k in range(8):                                        # резисторы и микросхемы с маркировкой
+        x, y = 300 + (k % 4) * 350, 300 + (k // 4) * 400
+        d.rectangle((x, y, x + 150, y + 70), fill=(15, 15, 15))
+        d.text((x + 25, y + 12), ('101', '730', '103', '472')[k % 4], font=small, fill=(235, 235, 235))
+    font = ImageFont.truetype(FONT, 48)
+    for i, num in enumerate((265, 266, 267)):                 # настоящие подписи — на светлом поле
+        x, y = 200 + i * 500, 1150
+        d.rectangle((x - 30, y - 30, x + 160, y + 80), fill=(200, 215, 205))
+        d.text((x, y), str(num), font=font, fill=(0, 0, 0))
+    path = str(tmp_path / 'board.jpg')
+    im.save(path, quality=90)
+    found = set(reader.read_numbers(path))
+    assert {265, 266, 267} <= found, sorted(found)
+    assert not found - {265, 266, 267}, sorted(found)

@@ -36,6 +36,8 @@ LABEL_DARKNESS_MAX = 50   # яркость цифр подписи (25-й про
 LABEL_DARKNESS_MAX_BIG = 35   # …а у цифр от 24 px — строже: их края JPEG почти не высветляет
 DARK_PERCENTILE = 25
 MIN_SCORE = 0.5           # средняя уверенность по цифрам числа
+MAX_INK_FRACTION = 0.4    # у подписи тёмного в рамке не больше (штрихи цифр)…
+MAX_BORDER_INK = 0.35     # …и края рамки светлые — иначе это белые цифры на тёмном
 MIN_CHAR_SCORE = 0.3      # цифра с краю с меньшей уверенностью — кусок линии
 MAX_NUMBER = 999
 
@@ -233,7 +235,7 @@ class NumberReader:
                     queue += [((x1 + a, y1, x1 + b, y2), splits_left - 1) for a, b in parts]
                     continue
             dark = float(np.percentile(brightness[y1:y2, x1:x2][sub_ink], DARK_PERCENTILE))
-            if dark > _dark_limit(text_h):
+            if dark > _dark_limit(text_h) or not _dark_text_on_light(sub_ink):
                 continue
             text, conf = self._recognize(np.where(sub_ink, 0, 255).astype(np.uint8))
             if len(text) > 3 and splits_left:
@@ -292,6 +294,16 @@ def _without_crossing_lines(ink: np.ndarray, x1: int, y1: int, x2: int, y2: int,
         else:
             i += 1
     return sub
+
+
+def _dark_text_on_light(sub_ink: np.ndarray) -> bool:
+    """Подписи — тёмные цифры на светлом фоне. Белые цифры на тёмном (маркировка на
+    корпусах SMD-деталей, надписи на плате) распознаватель тоже читает — их отсекаем:
+    у настоящей подписи тёмные только штрихи (≤ 0,3 рамки) и края рамки светлые."""
+    if sub_ink.shape[0] < 3 or sub_ink.shape[1] < 3:
+        return True
+    ring = np.concatenate([sub_ink[0], sub_ink[-1], sub_ink[:, 0], sub_ink[:, -1]])
+    return sub_ink.mean() <= MAX_INK_FRACTION and ring.mean() <= MAX_BORDER_INK
 
 
 def _split_by_gaps(sub_ink: np.ndarray, digit_h: float, min_gap_rel: float = 0.9,
